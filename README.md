@@ -102,8 +102,10 @@ LangGraphのアプリは、次の3つの要素で構成されます。
 
 Step1では、次の1本道だけのグラフを作ります。
 
-```
-START → chat(LLM呼び出し) → END
+```mermaid
+flowchart LR
+    S([START]) --> chat["chat<br/>(LLM呼び出し)"]
+    chat --> E([END])
 ```
 
 ```python
@@ -137,14 +139,12 @@ python step1_basic_graph.py
 LLM単体では最新情報の検索や正確な計算はできません。そこで「ツール」を
 LLMに使わせる仕組み(Function Calling)を導入し、以下のループを実装します。
 
-```
-START → agent(LLMが応答 or ツール呼び出しを判断)
-           │
-   ツール呼び出しあり ── → tools(ツールを実行) ─┐
-           │                                    │
-   ツール呼び出しなし                             │(結果を持って再度agentへ)
-           │                                    ↓
-           └────────────────→ END ←──── agent（再判断）
+```mermaid
+flowchart TD
+    S([START]) --> agent["agent<br/>(応答するか、ツールを呼ぶかを判断)"]
+    agent -->|"tool_calls あり"| tools["tools<br/>(ツールを実行)"]
+    tools -->|"結果を持って再度 agent へ"| agent
+    agent -->|"tool_calls なし"| E([END])
 ```
 
 これは **ReAct(Reasoning + Acting)パターン** と呼ばれ、
@@ -186,22 +186,14 @@ python step2_react_agent_with_tools.py
 
 ### 全体構成
 
-```
-                ┌─────────────┐
-        ┌──────▶│ researcher  │───┐
-        │       │ (Web検索担当) │   │
-        │       └─────────────┘   │
-   START│                          ▼
-        ├──────▶┌─────────────┐  supervisor
-        │       │   writer    │───┐
-        │       │ (執筆担当)   │   │
-        │       └─────────────┘   │
-        │                          │
-        └──────────────────────────┘
-                    │
-              (FINISHと判断)
-                    ▼
-                   END
+```mermaid
+flowchart TD
+    S([START]) --> sup{{"supervisor<br/>(司令塔)"}}
+    sup -->|"next = researcher"| res["researcher<br/>(Web検索担当)"]
+    sup -->|"next = writer"| wri["writer<br/>(執筆担当)"]
+    res -->|"done に researcher を追記"| sup
+    wri -->|"done に writer を追記"| sup
+    sup -->|"FINISH、または全員が作業済み"| E([END])
 ```
 
 - **supervisor**: 会話の状況を見て、次に「researcher」「writer」どちらを
