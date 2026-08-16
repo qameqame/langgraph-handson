@@ -20,6 +20,8 @@ LangGraphを使って、複数のAIエージェントが役割分担しながら
 4. エージェントのループが止まらない問題(`GraphRecursionError`)の原因を切り分け、
    終了条件を設計できる
 5. Checkpointer(記憶)を使って会話を継続できるCLIアプリを作れる
+6. Reducerを自作し、ターンをまたいで引き継ぐStateと引き継がないStateを
+   区別して設計できる
 
 ### 所要時間の目安
 
@@ -204,18 +206,30 @@ flowchart TD
 ### State: 会話履歴と「作業済みメンバー」
 
 ```python
-import operator
+def merge_done(current: list[str], update: Optional[list[str]]) -> list[str]:
+    """リストが来たら追記し、None が来たらリセットするReducer。"""
+    if update is None:
+        return []
+    return current + update
+
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]
-    next: str                                 # supervisorが選んだ次のメンバー(デバッグ用)
-    done: Annotated[list[str], operator.add]  # 作業を終えたメンバー
+    next: str                                # supervisorが選んだ次のメンバー(デバッグ用)
+    done: Annotated[list[str], merge_done]   # 作業を終えたメンバー
 ```
 
-`done` は後述のループ対策で使うフィールドです。Reducerに `operator.add` を
-指定しているので、各ノードが `{"done": ["writer"]}` を返すだけでリストに
-追記されます。Step1で学んだ `add_messages` と同じ「Reducerで追記」の考え方が、
-メッセージ以外のフィールドにもそのまま応用できることを確認してください。
+`done` は後述のループ対策で使うフィールドです。Reducerを指定しているので、
+各ノードが `{"done": ["writer"]}` を返すだけでリストに追記されます。
+Step1で学んだ `add_messages` と同じ「Reducerで追記」の考え方が、メッセージ
+以外のフィールドにもそのまま応用できることを確認してください。
+
+Reducerが `operator.add` ではなく自作の `merge_done` になっているのは、
+**「リセット」という更新を表現する必要がある**ためです。`operator.add` だと
+`[]` を渡しても `current + []` で何も変わらず、一度溜まった `done` を空に
+できません。`done` は「このターンで誰が働いたか」という1ターン限りの情報
+なので、Step4でcheckpointerを付けたときにリセットできないと壊れます
+(詳細はStep4の「落とし穴」を参照)。
 
 ### なぜ役割分担するのか?
 
@@ -232,7 +246,14 @@ class Router(TypedDict):
     next: Literal["researcher", "writer", "FINISH"]
 
 def supervisor_node(state: State) -> Command[Literal["researcher", "writer", "__end__"]]:
+    messages = state["messages"]
     done = state.get("done", [])
+
+    # 最後のメッセージがユーザー発言なら、新しいターンの始まり(Step4で重要)
+    new_turn = bool(messages) and messages[-1].type == "human"
+    if new_turn:
+        done = []
+
     remaining = [m for m in MEMBERS if m not in done]
 
     # ガード(b): 全員が作業を終えたらLLMに聞かずに終了する
@@ -244,7 +265,7 @@ def supervisor_node(state: State) -> Command[Literal["researcher", "writer", "__
         remaining=", ".join(remaining),
     )
     router = llm.with_structured_output(Router).invoke(
-        [("system", system), *state["messages"]]
+        [("system", system), *messages]
     )
     goto = router["next"]
 
@@ -254,7 +275,17 @@ def supervisor_node(state: State) -> Command[Literal["researcher", "writer", "__
         # 作業済みメンバーを選び直してきた場合は、未作業のメンバーへ回す
         goto = remaining[0]
 
-    return Command(goto=goto, update={"next": goto})
+    # ガード(c): writerはresearcherの調査結果を前提に書くので、researcherが先
+    if goto == "writer" and "researcher" not in done:
+        goto = "researcher"
+    # ガード(d): 最終回答を書くのはwriterなので、未実行のまま終了させない
+    if goto == END and "writer" not in done:
+        goto = "writer"
+
+    update = {"next": goto}
+    if new_turn:
+        update["done"] = None  # 前のターンの記録をStateからも消す
+    return Command(goto=goto, update=update)
 ```
 
 `with_structured_output(Router)` を使うことで、LLMの出力を自由文ではなく
@@ -305,7 +336,7 @@ writerが一度書き終えているのに、supervisorがwriterを選び続け�
 3. **終了判断を完全にLLM任せにしている** — 7Bクラスのローカルモデルは
    「もう終わっていい」という判断が特に苦手で、FINISHを選べない。
 
-対策として、Step3のコードには2つのガードを入れています。
+対策として、Step3のコードには4つのガードを入れています。
 
 - **(a) 作業済みメンバーをstateに記録し、プロンプトに明示する**
   `done` フィールドを用意し、`SUPERVISOR_PROMPT` に
@@ -314,9 +345,22 @@ writerが一度書き終えているのに、supervisorがwriterを選び続け�
 - **(b) 終了条件をプログラム側で持つ**
   全メンバーが作業を終えたらLLMに聞かず `END` へ。加えて、作業済みメンバーを
   選び直してきた場合は未作業のメンバーへフォールバックさせる。
+- **(c) メンバー間の依存関係を守らせる**
+  writerはresearcherの調査結果を前提に書くので、researcherが未実行なら
+  writerは選べない。
+- **(d) writerを飛ばして終了させない**
+  最終回答を書くのはwriterなので、writerが未実行のまま `END` に向かわせない。
+  ここを許すと、Stateの最後のメッセージが調査メモやユーザー発言のままになり、
+  呼び出し側が最終回答を取り出せなくなる(Step4のCLIがユーザーの入力を
+  そのまま鸚鵡返しする、という形で表面化します)。
 
 これで `supervisor → researcher → supervisor → writer → supervisor → END` の
 5ステップで安定して終了します。
+
+> **メンバーが2人だとガードで遷移が実質一意に決まってしまう**点には
+> 気づいたかもしれません。LLMによるルーティングが本当に効いてくるのは、
+> メンバーが増えて順序に自由度が出てきてからです。ここでは
+> 「ルーティングはLLM、不変条件はコード」という役割分担の形を掴んでください。
 
 > **教訓**: **遷移はLLMに決めさせても、終了条件はコード側で持つ。**
 > LLMの判断に「いつ止まるか」まで委ねると、モデルが小さいほど止まりません。
@@ -346,7 +390,38 @@ return Command(goto="supervisor", update={"messages": [...]})
 という便利関数で簡潔に実装し、最後に `Command(goto="supervisor", ...)` で
 supervisorに処理を戻しています。
 
-`writer_node` はツールを持たないシンプルなLLM呼び出しノードです。
+`writer_node` はツールを持たないシンプルなLLM呼び出しノードです。ただし
+**会話履歴をそのままLLMに渡していない**点に注目してください。
+
+```python
+def writer_node(state: State) -> Command[Literal["supervisor"]]:
+    transcript = format_transcript(state["messages"])
+    response = llm.invoke([
+        ("system", WRITER_PROMPT),
+        ("human", f"{transcript}\n\n---\n上記を踏まえて、回答を書いてください。"),
+    ])
+```
+
+researcher / writer の出力は `ai` メッセージとしてStateに積まれています。
+これを `llm.invoke([("system", ...), *state["messages"]])` のように素直に
+渡すと、モデルからは**「自分の発言が書きかけで止まっている」**ように見え、
+回答ではなく前の文の続きを書き始めます。実際に修正前は、こんな出力に
+なっていました。
+
+```
+[writer の最終回答]
+さらに、Pythonと統合性が高いことで知られています。
+```
+
+文頭が「さらに、」——完全に前の文の続きです。ひどいときには空文字が
+返ってきます。そこで `format_transcript()` で履歴を1つのテキストに畳み込み、
+`human` メッセージ1通として渡すことで、「これを読んで答える」という
+素直な形にしています。
+
+> **教訓**: マルチエージェントでは、他のエージェントの出力を
+> `ai` メッセージとして履歴に積むのが手軽ですが、それを次のLLM呼び出しに
+> そのまま流すと「続きを書くモード」に入ります。**他人の発言は
+> `ai` ロールで渡さない**、を意識してください。
 
 どちらのノードも、supervisorに戻る際に `update` で `done` に自分の名前を
 追記します。
@@ -406,6 +481,52 @@ python step4_memory_and_cli.py
 > Checkpointerです。永続化したい場合はLangGraphが提供する
 > SQLite/Postgres向けのCheckpointerに差し替えられます(本ハンズオンの範囲外)。
 
+### 落とし穴: 「引き継がれてはいけないState」がある
+
+checkpointerは **Stateを丸ごと** 引き継ぎます。`messages` は引き継いでほしい
+情報ですが、Step3で追加した `done`(このターンで誰が働いたか)は
+**1ターン限りの情報**です。素朴に実装すると、2ターン目でこうなります。
+
+```
+===== turn 1: LangGraphとは何ですか?
+  node=supervisor next='researcher'
+  node=researcher
+  node=supervisor next='writer'
+  node=writer
+  node=supervisor next='__end__'
+  -> state done=['researcher', 'writer']
+
+===== turn 2: その中で状態管理はどう扱いますか?
+  node=supervisor next='__end__'      ← 誰も働かずに即終了
+  -> last: 'その中で状態管理はどう扱いますか?'
+```
+
+`done` に前のターンの `['researcher', 'writer']` が残っているため、
+supervisorが「全員作業済み」と誤判定してガード(b)が発動しています。
+最後のメッセージがユーザーの質問のままなので、CLIは
+**ユーザーの入力をそのまま鸚鵡返しします**。
+
+対策は2つセットで必要です。
+
+1. **リセットできるReducerにする** — `operator.add` では「空にする」が
+   表現できないので、`None` をリセット指示として解釈する `merge_done` を自作する。
+2. **ターンの境界を検出する** — supervisorが「最後のメッセージがユーザー発言か」
+   を見て、新しいターンなら `done` を捨てる。
+
+```python
+new_turn = bool(messages) and messages[-1].type == "human"
+if new_turn:
+    done = []
+...
+if new_turn:
+    update["done"] = None  # Stateからも消す
+```
+
+> **教訓**: checkpointerを導入したら、**Stateの各フィールドについて
+> 「これはターンをまたいで引き継ぐべきか」を1つずつ判断する。**
+> 「会話の記憶」と「1回の処理の作業メモ」が同じStateに同居しているのが
+> 事故の元です。ライフサイクルの違うデータが混ざっていないか点検してください。
+
 ---
 
 ## 演習問題
@@ -439,6 +560,8 @@ python step4_memory_and_cli.py
 | ツール呼び出しがうまくいかない/構造化出力でエラーになる | モデルをツール呼び出し対応のもの(`qwen2.5`系、`llama3.1`系など)に変更する |
 | 何分待っても応答が返ってこない(ハングする) | 一部のthinkingモデル(qwen3系など)はOllama側の不具合で生成が終端しないことがある。`ollama run <モデル名> "テスト"`をLangGraphを介さず単体で実行して同様にハングするか切り分け、ハングする場合はthinkingモードを持たないモデル(`qwen2.5:7b-instruct`など)に変更する |
 | `GraphRecursionError` で止まる | supervisorが同じメンバーを選び続けている可能性が高い。まず `graph.stream(..., stream_mode="updates")` で各ステップの遷移先を出力して原因を特定する。値を増やすのではなく、作業済みメンバーをstateに記録してプロンプトに明示し、終了条件をコード側で持つ(Step3「落とし穴」の節を参照) |
+| Step4で2ターン目以降、自分の入力が鸚鵡返しされる | `done` が前のターンから引き継がれ、supervisorが「全員作業済み」と誤判定している。Step4「落とし穴」の節を参照 |
+| 回答が「さらに、〜」「つまり、〜」など文の途中から始まる/空になる | 他のエージェントの出力を `ai` メッセージとしてLLMに渡しており、モデルが「続きを書くモード」に入っている。Step3「researcher / writer の実装」の節を参照 |
 | Web検索がエラーになる | ネットワーク接続を確認する。DuckDuckGo側のレート制限の場合は少し待って再実行する |
 
 ---

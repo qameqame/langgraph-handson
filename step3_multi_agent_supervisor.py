@@ -21,12 +21,15 @@ Step 3: マルチエージェント連携(Supervisorパターン)
   (a) 作業済みメンバーを state に記録してプロンプトに明示する
   (b) 全員が作業を終えたらLLMに聞かず終了する
   という2つのガードを入れて、ループを構造的に防いでいる。
+- ただし(a)の記録は「1ターン分」の情報なので、Step4のようにcheckpointerで
+  Stateを引き継ぐと前のターンの記録が残り、逆に何も作業せず終了してしまう。
+  そのためReducerを自作(merge_done)して、新しいユーザー発言を受け取った
+  タイミングで記録をリセットしている。
 
 事前準備:
     ollama pull qwen2.5:7b-instruct
 """
-import operator
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, Literal, Optional, TypedDict
 
 from langchain_ollama import ChatOllama
 from langgraph.graph import END, START, StateGraph
@@ -42,12 +45,25 @@ llm = ChatOllama(model=MODEL_NAME, temperature=0)
 
 
 # --- State ---
+def merge_done(current: list[str], update: Optional[list[str]]) -> list[str]:
+    """`done` フィールド用のReducer。
+
+    リストが来たら追記し、None が来たらリセットする。
+    リセットが必要なのは、Step4のようにcheckpointerを付けたときに
+    `done` が前のターンの値を持ち越してしまうため(単なる operator.add では
+    「空にする」という更新が表現できない)。
+    """
+    if update is None:
+        return []
+    return current + update
+
+
 class State(TypedDict):
     messages: Annotated[list, add_messages]
     next: str  # supervisorが選んだ「次に呼ぶエージェント名」を記録(デバッグ用)
-    # 作業を終えたメンバー名。operator.add をreducerにすることで、
-    # 各ノードが ["writer"] を返すだけでリストに追記される。
-    done: Annotated[list[str], operator.add]
+    # 作業を終えたメンバー名。各ノードは ["writer"] を返すだけで追記され、
+    # None を返すとリセットされる(merge_done 参照)。
+    done: Annotated[list[str], merge_done]
 
 
 # --- Supervisor: 次にどのエージェントを呼ぶか決定するノード ---
@@ -74,7 +90,17 @@ class Router(TypedDict):
 
 
 def supervisor_node(state: State) -> Command[Literal["researcher", "writer", "__end__"]]:
+    messages = state["messages"]
     done = state.get("done", [])
+
+    # 最後のメッセージがユーザー発言なら、新しいターンの始まり。
+    # checkpointer(Step4)を使う場合、doneには前のターンの
+    # ["researcher", "writer"] が残っているため、ここで捨てないと
+    # 「全員作業済み」と誤判定して新しい質問に答えずに終了してしまう。
+    new_turn = bool(messages) and messages[-1].type == "human"
+    if new_turn:
+        done = []
+
     remaining = [m for m in MEMBERS if m not in done]
 
     # ガード(b): 全員が作業を終えたらLLMに聞かずに終了する。
@@ -88,7 +114,7 @@ def supervisor_node(state: State) -> Command[Literal["researcher", "writer", "__
         remaining=", ".join(remaining),
     )
     router = llm.with_structured_output(Router).invoke(
-        [("system", system), *state["messages"]]
+        [("system", system), *messages]
     )
     goto = router["next"]
 
@@ -98,7 +124,20 @@ def supervisor_node(state: State) -> Command[Literal["researcher", "writer", "__
         # 作業済みメンバーを選び直してきた場合は、未作業のメンバーへ回す
         goto = remaining[0]
 
-    return Command(goto=goto, update={"next": goto})
+    # ガード(c): メンバー間の依存関係を守らせる。
+    # writerはresearcherの調査結果を前提に執筆するので、researcherが先。
+    if goto == "writer" and "researcher" not in done:
+        goto = "researcher"
+    # ガード(d): 最終回答を書くのはwriterなので、writerが未実行のまま
+    # 終了させない。ここを許すと、Stateの最後のメッセージが調査メモや
+    # ユーザー発言のままになり、呼び出し側が最終回答を取り出せない。
+    if goto == END and "writer" not in done:
+        goto = "writer"
+
+    update = {"next": goto}
+    if new_turn:
+        update["done"] = None  # 前のターンの記録をStateからも消す
+    return Command(goto=goto, update=update)
 
 
 # --- Researcher: Web検索ツールを持つReActエージェント ---
@@ -129,14 +168,38 @@ def researcher_node(state: State) -> Command[Literal["supervisor"]]:
 
 # --- Writer: 収集済みの情報をもとに最終回答を執筆するノード ---
 WRITER_PROMPT = (
-    "あなたは執筆担当(writer)です。これまでの会話(特にresearcherの調査結果)を"
-    "踏まえて、ユーザーの質問に対する分かりやすい日本語の回答を作成してください。"
+    "あなたは執筆担当(writer)です。渡された会話とresearcherの調査結果を"
+    "踏まえて、ユーザーの最新の質問に対する分かりやすい日本語の回答を"
+    "作成してください。回答本文だけを出力し、前置きや見出しは付けないでください。"
 )
 
 
+def format_transcript(messages: list) -> str:
+    """会話履歴を1つのテキストに畳み込む。
+
+    researcher / writer の出力は ai メッセージとしてStateに積まれているため、
+    これをそのままLLMに渡すと「自分の発言が書きかけの状態」に見えてしまい、
+    モデルが回答ではなく“前の文の続き”を書き始める(ときには空文字を返す)。
+    履歴をテキストとして human メッセージ1つに畳み込むことで、
+    「これを読んで答える」という素直な形にする。
+    """
+    lines = []
+    for m in messages:
+        if not m.content.strip():
+            continue
+        speaker = "ユーザー" if m.type == "human" else "チーム"
+        lines.append(f"{speaker}: {m.content}")
+    return "\n\n".join(lines)
+
+
 def writer_node(state: State) -> Command[Literal["supervisor"]]:
-    messages = [("system", WRITER_PROMPT), *state["messages"]]
-    response = llm.invoke(messages)
+    transcript = format_transcript(state["messages"])
+    response = llm.invoke(
+        [
+            ("system", WRITER_PROMPT),
+            ("human", f"{transcript}\n\n---\n上記を踏まえて、回答を書いてください。"),
+        ]
+    )
     return Command(
         goto="supervisor",
         # 「回答案」だとsupervisorが「まだ未完成」と解釈して writer を
